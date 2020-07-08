@@ -1,1 +1,215 @@
-/Users/ww155710/bin/mq
+#! /bin/bash
+#
+# Manipulating MQ files. Work with both MQ and Guilt (not complete).
+# Note: no matter MQ or guilt, the repo for the patches is itself Mercurial.
+#
+# For guilt, make sure adding alias
+#   mq = ! /space/repos/external/guilt/guilt
+
+if [ "$1" = "" ]; then
+    cat<<EOF
+Usage:
+    mq log [-a]               view history of patch
+    mq diff [name] [r1] [r2]  diff patch (def last 2)
+    mq revert [r]             revert to another version
+    mq vi                     vi .hg/patches/series
+    mq ls                     hg qseries | head
+    mq pr [-b base] [name]    create a branch and start pr
+    mq [q]push/pop/ref/new/...
+EOF
+    exit 0
+fi
+
+hg root > /dev/null 2> /dev/null
+if [ $? = 0 ]; then
+    MERCURIAL=1
+    cd $(hg root)
+    _qq=`hg qqueue --active 2> /dev/null`
+    if [ "$_qq" != "patches" ]; then
+        MQ=.hg/patches-$_qq
+    else
+        MQ=.hg/patches
+    fi
+else
+    MERCURIAL=0
+    CB=`git branch --show-current`
+    if [[ "$CB" != "master" && "$CB" != "guilt/master" ]]; then
+        echo Not on master. Please run
+        echo git switch guilt/master
+        exit 1
+    fi
+    cd $(git rev-parse --show-toplevel)
+    MQ=.git/patches/master
+fi
+
+CMD=$1
+shift
+
+if [[ $CMD != top && $CMD != qtop ]]; then
+    QNAME=`mq top`
+fi
+
+case $CMD in
+    ls ) # what is in patch
+        head $MQ/$QNAME
+        echo ==========
+        lsdiff $MQ/$QNAME
+        ;;
+    vi ) # manipulate MQ order
+        vi $MQ/series
+        ;;
+    log ) # look at history of MQ repo (-a for all, none for qtop)
+        if [ "$1" = "-a" ]; then
+            hg logs --cwd $MQ
+        else
+            hg logs --cwd $MQ $QNAME
+        fi
+        ;;
+    diff ) # interdiff for two versions of qtop
+        if [ "$2" != "" ]; then # versions specified
+            R1=$1
+            R2=$2
+        elif [ "$1" != "" ]; then # one vs current
+            R1=$1
+            R2=`mq log | head -1 | cut -f 1 -d :`
+        else # latest two
+            R1=`mq log | head -2 | tail -1 | cut -f 1 -d :`
+            R2=`mq log | head -1 | cut -f 1 -d :`
+        fi
+
+        echo "First ($R1):"
+        hg --cwd $MQ log -r $R1:0 --limit 1 $QNAME
+        echo
+        echo "Second ($R2):"
+        hg --cwd $MQ log -r $R2:0 --limit 1 $QNAME
+
+        hg --cwd $MQ cat -r $R1 $QNAME | grep -v ^new | grep -v ^deleted > /tmp/mqdiff.1.$$
+        hg --cwd $MQ cat -r $R2 $QNAME | grep -v ^new | grep -v ^deleted > /tmp/mqdiff.2.$$
+        interdiff -i /tmp/mqdiff.1.$$ /tmp/mqdiff.2.$$
+        if [ $? != 0 ]; then
+            echo "Want to see raw diff?"
+            read
+            diff /tmp/mqdiff.1.$$ /tmp/mqdiff.2.$$
+        fi
+        ;;
+    revert ) # revert current patch to a previous version
+        if [ $MERCURIAL = 0 ]; then
+            echo Cannot call revert in git repo
+            exit 1
+        fi
+        if [ -n "`hg st -mard`" ]; then
+            echo "Working dir must be clean"
+            exit 1
+        fi
+
+        if [ "$1" = "" ]; then
+            echo "Must provide a revision"
+            exit 1
+        fi
+      
+        REV=$1
+
+        hg --cwd $MQ cat -r $REV $QNAME > $MQ/$QNAME
+        hg qpop
+        hg qpush
+        echo "MQ is updated but not committed. hg qref if you like it, or hg revert --mq $QNAME if not."
+        ;;
+    help )
+        if [ $MERCURIAL = 1 ]; then
+            hg help mq
+        else
+            /space/repos/external/guilt/guilt
+        fi
+        ;;
+    pr ) # copy qtop to a new branch for publishing
+        if [ $MERCURIAL = 1 ]; then
+            echo Cannot call pr in hg repo
+            exit 1
+        fi
+        QNAME=$(mq top)
+        # "-b bname" means the new branch will be based on another branch
+        if [ "$1" = "-b" ]; then
+            shift
+            QBASE=$1
+            shift
+        else
+            QBASE=master
+        fi
+        # branch name will be specified name, bug id, or patch name
+        BRANCH=$QNAME
+        if [ "$1" != "" ]; then # branch name specified
+            BRANCH=$1
+        else
+            ID=$(git log --format=%B -n 1 | head -1 | perl -ne 'print "$1" if /^(\d{7}):/')
+            if [ "$ID" != "" ]; then
+                BRANCH=$ID
+            fi
+        fi
+        git show-ref --verify --quiet refs/heads/$BRANCH
+        if [ "$?" = 0 ]; then
+            # exist branch
+            # print out header
+            git format-patch -1 --stdout | perl -ne 'print if //../^$/' > /tmp/pr
+            # add increment patch
+            git diff $BRANCH >> /tmp/pr
+            echo "Will amend to existing branch $BRANCH to hold the change to:"
+            lsdiff /tmp/pr
+            echo "Press enter to continue, or Ctrl-C to terminate"
+            read
+            git switch $BRANCH
+        else
+            # new branch
+            git format-patch -1 --stdout > /tmp/pr
+            echo "Will create a new branch $BRANCH on $QBASE to hold the change to:"
+            lsdiff /tmp/pr
+            echo "Press enter to continue, or Ctrl-C to terminate"
+            read
+            git switch $QBASE
+            git checkout -b $BRANCH
+        fi
+        git am /tmp/pr
+        echo 'You can call "git publish" and "git pr create" now.'
+        ;;
+    * ) # original mq an dguilt commands
+        if [[ $CMD =~ ^q ]]; then # Either "qpop" and "pop" is OK
+            CMD=${CMD:1}
+        fi
+        if [ $MERCURIAL = 1 ]; then
+            hg q$CMD $@
+            # We have MQ hooks to record the history
+        else
+            if [ "$CMD" = "finish" ]; then
+                echo "Do not call finish in git"
+                echo "Instead, call 'mq pr' to copy the change into a branch"
+                ech0 "and create a PR from there."
+                exit 0
+            fi
+            git mq $CMD "$@"
+            # Manually record the history
+            if [ $CMD = init ]; then
+                # hg init --cwd $MQ
+                afterqinit
+            else
+                cd $MQ
+                if [[ $CMD =~ ^ref ]]; then
+                    read -p "Comment: " q
+                    rm $QNAME~
+                    echo "$QNAME: $q" | hg commit -A -l -
+                else
+                    # Some commands will not make a change so need to
+                    # record history. This list needs not to be complete
+                    # as `hg commit` will find out if there's any change.
+                    case $CMD in
+                    top | series | pop | push | top | goto | next | prev | diff )
+                        ;;
+                    * )
+                        hg commit -A -m "auto-commit: $CMD $@" > /dev/null
+                        ;;
+                    esac
+                fi
+            fi
+        fi
+        ;;
+esac
+
+
