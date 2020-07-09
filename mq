@@ -9,7 +9,9 @@
 if [ "$1" = "" ]; then
     cat<<EOF
 Usage:
+    mq back                   switch to guilt/master
     mq log [-a]               view history of patch
+    mq cat [-n] [name]        cat this/next/named patch
     mq diff [name] [r1] [r2]  diff patch (def last 2)
     mq revert [r]             revert to another version
     mq vi                     vi .hg/patches/series
@@ -19,6 +21,15 @@ Usage:
 EOF
     exit 0
 fi
+
+function q2id {
+    ID=$(head -1 $MQ/$1 | perl -ne 'print "$1" if /^(\d{7}):/')
+    if [ "$ID" != "" ]; then
+        echo $ID
+    else
+        echo $1
+    fi
+}
 
 hg root > /dev/null 2> /dev/null
 if [ $? = 0 ]; then
@@ -32,6 +43,10 @@ if [ $? = 0 ]; then
     fi
 else
     MERCURIAL=0
+    if [ "$1" = "back" ]; then
+        git switch guilt/master
+        exit 0
+    fi
     CB=`git branch --show-current`
     if [[ "$CB" != "master" && "$CB" != "guilt/master" ]]; then
         echo Not on master. Please run
@@ -54,6 +69,15 @@ case $CMD in
         head $MQ/$QNAME
         echo ==========
         lsdiff $MQ/$QNAME
+        ;;
+    cat )
+        if [ "$1" = "" ]; then
+            cat $MQ/$QNAME
+        elif [ "$1" = "-n" ]; then
+        cat $MQ/`mq next`
+        else
+            cat $MQ/$1
+        fi
         ;;
     vi ) # manipulate MQ order
         vi $MQ/series
@@ -136,37 +160,23 @@ case $CMD in
             QBASE=master
         fi
         # branch name will be specified name, bug id, or patch name
-        BRANCH=$QNAME
         if [ "$1" != "" ]; then # branch name specified
             BRANCH=$1
         else
-            ID=$(git log --format=%B -n 1 | head -1 | perl -ne 'print "$1" if /^(\d{7}):/')
-            if [ "$ID" != "" ]; then
-                BRANCH=$ID
-            fi
+            BRANCH=`q2id $QNAME`
         fi
-        git show-ref --verify --quiet refs/heads/$BRANCH
-        if [ "$?" = 0 ]; then
-            # exist branch
-            # print out header
-            git format-patch -1 --stdout | perl -ne 'print if //../^$/' > /tmp/pr
-            # add increment patch
-            git diff $BRANCH >> /tmp/pr
-            echo "Will amend to existing branch $BRANCH to hold the change to:"
-            lsdiff /tmp/pr
-            echo "Press enter to continue, or Ctrl-C to terminate"
-            read
-            git switch $BRANCH
-        else
-            # new branch
-            git format-patch -1 --stdout > /tmp/pr
-            echo "Will create a new branch $BRANCH on $QBASE to hold the change to:"
-            lsdiff /tmp/pr
-            echo "Press enter to continue, or Ctrl-C to terminate"
-            read
-            git switch $QBASE
-            git checkout -b $BRANCH
-        fi
+        git format-patch -1 --stdout | perl -ne 'print if //../^$/' > /tmp/pr
+        echo >> /tmp/pr
+        git diff $QBASE guilt/master >> /tmp/pr
+
+        echo "Will create a new branch $BRANCH on $QBASE to hold the change to:"
+        head -1 /tmp/pr
+        lsdiff /tmp/pr
+        echo "Press enter to continue, or Ctrl-C to terminate"
+        read
+
+        git branch $BRANCH $QBASE
+        git switch $BRANCH
         git am /tmp/pr
         echo 'You can call "git publish" and "git pr create" now.'
         ;;
@@ -183,6 +193,20 @@ case $CMD in
                 echo "Instead, call 'mq pr' to copy the change into a branch"
                 ech0 "and create a PR from there."
                 exit 0
+            elif [[ "$CMD" =~ ^del ]]; then
+                for a in $@; do
+                    BRANCH=`q2id $a`
+                    git show-ref --verify --quiet refs/heads/$BRANCH &&
+                        echo "Will remove $BRANCH at local and origin..."
+                done
+                echo "Press enter to continue, or Ctrl-C to terminate"
+                read
+                for a in $@; do
+                    BRANCH=`q2id $a`
+                    echo "removing $a/$BRANCH..."
+                    git branch -d $BRANCH
+                    git push origin --delete $BRANCH
+                done
             fi
             git mq $CMD "$@"
             # Manually record the history
